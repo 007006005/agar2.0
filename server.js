@@ -1,9 +1,8 @@
 'use strict';
 
 /*
- * Server Agar.io per Railway (Express + WebSockets)
- * Gestisce l'handshake binario, il routing statico, gli header CORS/JSON
- * e il ciclo di gioco in tempo reale.
+ * Server ZeroAgar per Railway (Express + WebSockets)
+ * Serve i file statici dalla cartella ./public e gestisce il protocollo binario di gioco.
  */
 
 const express = require('express');
@@ -18,10 +17,15 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-// ---------------------------------------------------------------- Express & Static Routes
+// ---- Variabili d'ambiente (Login / Salvataggi)
+const AUTH_SECRET  = process.env.AUTH_SECRET  || '';
+const SERVER_KEY   = process.env.SERVER_KEY   || '';
+const API_SAVE_URL = process.env.API_SAVE_URL || '';
+
+// ---- Middleware & CORS
 app.use(cors());
 
-// Gestione corretta dei tipi MIME e header per PWA / Manifest
+// Forzatura Header per manifest.json e file JSON
 app.use((req, res, next) => {
     if (req.url.endsWith('.json')) {
         res.setHeader('Content-Type', 'application/json');
@@ -29,54 +33,43 @@ app.use((req, res, next) => {
     next();
 });
 
-// Servizio dei file statici dalla cartella public o root
-if (fs.existsSync(PUBLIC_DIR)) {
-    app.use(express.static(PUBLIC_DIR, {
-        setHeaders: (res, reqPath) => {
-            if (reqPath.endsWith('.webp') || reqPath.endsWith('.png') || reqPath.endsWith('.svg')) {
-                res.setHeader('Cache-Control', 'public, max-age=31536000');
-            }
+// Servizio file statici da public/
+app.use(express.static(PUBLIC_DIR, {
+    setHeaders: (res, reqPath) => {
+        if (reqPath.endsWith('.webp') || reqPath.endsWith('.png') || reqPath.endsWith('.svg') || reqPath.endsWith('.json')) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000');
         }
-    }));
-}
-app.use(express.static(__dirname));
+    }
+}));
 
-// Endpoint di Health Check obbligatorio per i deployment Railway
+// Endpoint Health Check per Railway
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Routing dinamico per il gioco
-app.get('/', (req, res) => {
-    const gamePath = path.join(PUBLIC_DIR, 'games', 'agar', 'game.html');
-    if (fs.existsSync(gamePath)) return res.sendFile(gamePath);
-    const rootGame = path.join(__dirname, 'game.html');
-    if (fs.existsSync(rootGame)) return res.sendFile(rootGame);
-    res.status(404).send('Game file not found');
-});
+// Redirezioni e gestione percorsi del gioco
+app.get('/', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'game.html')));
+app.get('/index.html', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'game.html')));
+app.get('/games/agar', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'game.html')));
+app.get('/games/agar/*', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'game.html')));
 
-app.get('/games/agar', (req, res) => res.redirect('/games/agar/game.html'));
-app.get('/games/agar/', (req, res) => res.redirect('/games/agar/game.html'));
-
-// Fallback generale per risorse statiche
+// Fallback generale
 app.get('*', (req, res) => {
-    const requestedFile = path.join(PUBLIC_DIR, req.path);
-    if (fs.existsSync(requestedFile) && fs.statSync(requestedFile).isFile()) {
-        return res.sendFile(requestedFile);
+    const requestedPath = path.join(PUBLIC_DIR, req.path);
+    if (fs.existsSync(requestedPath) && fs.statSync(requestedPath).isFile()) {
+        return res.sendFile(requestedPath);
     }
-    const fallbackPath = path.join(PUBLIC_DIR, 'games', 'agar', 'game.html');
-    if (fs.existsSync(fallbackPath)) return res.sendFile(fallbackPath);
-    res.sendFile(path.join(__dirname, 'game.html'));
+    res.sendFile(path.join(PUBLIC_DIR, 'game.html'));
 });
 
-// ---------------------------------------------------------------- Configurazione Mondo di Gioco
+// ---- Configurazione Mondo di Gioco
 const CFG = {
     border: 14000,
-    tickMs: 40,             // 25 tick/sec
+    tickMs: 40,             // 25 tick/s
     foodMax: 800, foodSize: 10,
     virusMax: 15, virusSize: 100,
     startSize: 32, minSplitSize: 60, maxCells: 16,
     ejectSize: 36, ejectCostArea: 1600, minEjectSize: 57,
     maxSize: 1500,
-    mergeBaseTicks: 375,   // ~15 secondi per ricongiungersi
+    mergeBaseTicks: 375,   // ~15s
     viewHalfW: 1100, viewHalfH: 700,
     maxPlayers: 100,
 };
@@ -125,7 +118,7 @@ function newPlayerCell(p, x, y, size) {
     return c;
 }
 
-// ---------------------------------------------------------------- Utility Binarie
+// ---- Utility Binarie WebSocket
 const strBytes = (s) => (s.length + 1) * 2;
 function putStr(buf, off, s) {
     for (let i = 0; i < s.length; i++) buf.writeUInt16LE(s.charCodeAt(i), off + 2 * i);
@@ -140,25 +133,19 @@ function sendRaw(p, buf) {
 function sendBorder(p) {
     const b = Buffer.alloc(33);
     b[0] = 64;
-    b.writeDoubleLE(0, 1); 
-    b.writeDoubleLE(0, 9);
-    b.writeDoubleLE(CFG.border, 17); 
-    b.writeDoubleLE(CFG.border, 25);
+    b.writeDoubleLE(0, 1); b.writeDoubleLE(0, 9);
+    b.writeDoubleLE(CFG.border, 17); b.writeDoubleLE(CFG.border, 25);
     sendRaw(p, b);
 }
 
 function send32(p, id) {
-    const b = Buffer.alloc(5); 
-    b[0] = 32; 
-    b.writeUInt32LE(id, 1); 
-    sendRaw(p, b);
+    const b = Buffer.alloc(5); b[0] = 32; b.writeUInt32LE(id, 1); sendRaw(p, b);
 }
 
 function sendChatMsg(p, name, color, text) {
     const b = Buffer.alloc(5 + strBytes(name) + strBytes(text));
     b[0] = 99; b[1] = 0; b[2] = color[0]; b[3] = color[1]; b[4] = color[2];
-    let o = putStr(b, 5, name); 
-    putStr(b, o, text);
+    let o = putStr(b, 5, name); putStr(b, o, text);
     sendRaw(p, b);
 }
 
@@ -166,16 +153,13 @@ function totalArea(p) {
     return p.cells.reduce((s, c) => s + c.size * c.size, 0); 
 }
 
-// ---------------------------------------------------------------- Meccaniche Giocatore
+// ---- Logica Giocatore
 function spawnPlayer(p, name) {
     if (p.cells.length) return;
-    p.name = name; 
-    p.alive = true; 
-    p.spectate = false;
+    p.name = name; p.alive = true; p.spectate = false;
     const x = rnd(500, CFG.border - 500);
     const y = rnd(500, CFG.border - 500);
-    p.mouseX = x; 
-    p.mouseY = y;
+    p.mouseX = x; p.mouseY = y;
     newPlayerCell(p, x, y, CFG.startSize);
 }
 
@@ -186,11 +170,9 @@ function split(p) {
         const c = p.cells[i];
         if (!c || c.size < CFG.minSplitSize) continue;
         let dx = p.mouseX - c.x, dy = p.mouseY - c.y;
-        const d = Math.hypot(dx, dy) || 1; 
-        dx /= d; dy /= d;
+        const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
         const s = Math.sqrt(c.size * c.size / 2);
-        c.size = s; 
-        c.mergeAt = tickCount + mergeDelay(s);
+        c.size = s; c.mergeAt = tickCount + mergeDelay(s);
         const nc = newPlayerCell(p, c.x, c.y, s);
         nc.bx = dx; nc.by = dy; nc.bs = 40;
     }
@@ -200,8 +182,7 @@ function eject(p) {
     for (const c of p.cells.slice()) {
         if (c.size < CFG.minEjectSize) continue;
         let dx = p.mouseX - c.x, dy = p.mouseY - c.y;
-        const d = Math.hypot(dx, dy) || 1; 
-        dx /= d; dy /= d;
+        const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
         c.size = Math.sqrt(Math.max(1, c.size * c.size - CFG.ejectCostArea));
         const e = addCell('eject', c.x + dx * c.size, c.y + dy * c.size, CFG.ejectSize, c.color, p);
         e.bx = dx; e.by = dy; e.bs = 36;
@@ -214,8 +195,7 @@ function popCell(p, c, virus) {
     const extra = Math.min(CFG.maxCells - p.cells.length, 7);
     if (extra <= 0) { c.size = Math.sqrt(total); return; }
     const ps = Math.sqrt(total / (extra + 1));
-    c.size = ps; 
-    c.mergeAt = tickCount + mergeDelay(ps);
+    c.size = ps; c.mergeAt = tickCount + mergeDelay(ps);
     const a0 = Math.random() * Math.PI * 2;
     for (let i = 0; i < extra; i++) {
         const a = a0 + i * (Math.PI * 2 / extra);
@@ -234,13 +214,12 @@ function eatCell(eater, prey) {
     }
 }
 
-// ---------------------------------------------------------------- Loop di Aggiornamento
+// ---- Loop Tick del Server
 function tick() {
     tickCount++;
     eatEvents = [];
     const B = CFG.border;
 
-    // Movimento
     for (const c of cells.values()) {
         if (c.type === 'player') {
             const p = c.owner;
@@ -248,13 +227,11 @@ function tick() {
             const d = Math.hypot(dx, dy);
             if (d > 1) {
                 const sp = Math.min(d, 88 * Math.pow(c.size, -0.439));
-                c.x += dx / d * sp; 
-                c.y += dy / d * sp;
+                c.x += dx / d * sp; c.y += dy / d * sp;
             }
         }
         if (c.bs > 0.5) {
-            c.x += c.bx * c.bs; 
-            c.y += c.by * c.bs;
+            c.x += c.bx * c.bs; c.y += c.by * c.bs;
             c.bs *= (c.type === 'eject' ? 0.88 : 0.9);
         } else c.bs = 0;
         
@@ -263,7 +240,6 @@ function tick() {
         c.y = Math.max(r, Math.min(B - r, c.y));
     }
 
-    // Collisioni & Fusione
     for (const p of players) {
         const cs = p.cells;
         for (let i = 0; i < cs.length; i++) {
@@ -287,7 +263,6 @@ function tick() {
         }
     }
 
-    // Mangiare cibi, giocatori e virus
     for (const p of players) {
         for (const c of p.cells.slice()) {
             if (c.dead) continue;
@@ -309,7 +284,6 @@ function tick() {
         }
     }
 
-    // Rigenerazione cibi e virus
     for (let i = 0; i < 6 && foodCount < CFG.foodMax; i++) {
         addCell('food', rnd(20, CFG.border - 20), rnd(20, CFG.border - 20), CFG.foodSize, randColor());
     }
@@ -317,16 +291,13 @@ function tick() {
         addCell('virus', rnd(300, CFG.border - 300), rnd(300, CFG.border - 300), CFG.virusSize, [51, 255, 51]);
     }
 
-    // Costruzione pacchetto Classifica
     let lbBuf = null;
     if (tickCount % 25 === 0) {
         const top = Array.from(players).filter(p => p.cells.length)
             .map(p => ({ p, a: totalArea(p) })).sort((a, b) => b.a - a.a).slice(0, 10);
         let size = 5; 
         for (const t of top) size += 4 + strBytes(t.p.name);
-        lbBuf = Buffer.alloc(size); 
-        lbBuf[0] = 49; 
-        lbBuf.writeUInt32LE(top.length, 1);
+        lbBuf = Buffer.alloc(size); lbBuf[0] = 49; lbBuf.writeUInt32LE(top.length, 1);
         let o = 5;
         for (const t of top) { 
             lbBuf.writeUInt32LE(t.p.cells[0].id, o); 
@@ -334,7 +305,6 @@ function tick() {
         }
     }
 
-    // Invio stato della mappa ai client
     let leader = null;
     for (const p of players) if (p.cells.length && (!leader || totalArea(p) > totalArea(leader))) leader = p;
     
@@ -344,7 +314,7 @@ function tick() {
         const ref = p.cells.length ? p : (p.spectate ? leader : null);
         if (ref && ref.cells.length) {
             cx = ref.cells.reduce((s, c) => s + c.x, 0) / ref.cells.length;
-            cy = ref.cells.reduce((s, c) => s + c.y, 0) / ref.cells.length;
+            cy = ref.cells.reduce((s, c) => s + c.size, 0) / ref.cells.length;
             total = ref.cells.reduce((s, c) => s + c.size, 0);
         }
         const scale = Math.pow(Math.min(64 / total, 1), 0.4);
@@ -390,7 +360,7 @@ function tick() {
     }
 }
 
-// ---------------------------------------------------------------- Server HTTP & WebSockets
+// ---- Avvio WebSockets & Server HTTP
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 2048 });
 
@@ -404,7 +374,6 @@ wss.on('connection', (ws) => {
     };
     players.add(p);
     
-    // Rispondi con i bordi iniziali per sbloccare l'handshake del client
     sendBorder(p);
 
     ws.on('message', (data, isBinary) => {
@@ -414,12 +383,10 @@ wss.on('connection', (ws) => {
         switch (op) {
             case 254:
             case 255:
-                // Handshake Agar.io: reinvia le coordinate del bordo per confermare il collegamento
                 sendBorder(p);
                 break;
             case 0:
             case 192: {
-                // Comando di Spawn col nickname
                 let name = '';
                 if (data.length > 1) {
                     name = data.toString('utf16le', 1).replace(/[\u0000-\u001f]/g, '').slice(0, 30);
@@ -431,21 +398,14 @@ wss.on('connection', (ws) => {
                 if (!p.cells.length) p.spectate = true;
                 break;
             case 16:
-                // Posizione del cursore mouse
                 if (data.length >= 13) {
                     const x = data.readDoubleLE(1);
                     const y = data.readDoubleLE(5);
-                    if (Number.isFinite(x) && Number.isFinite(y)) { 
-                        p.mouseX = x; 
-                        p.mouseY = y; 
-                    }
+                    if (Number.isFinite(x) && Number.isFinite(y)) { p.mouseX = x; p.mouseY = y; }
                 } else if (data.length >= 9) {
                     const x = data.readInt16LE(1);
                     const y = data.readInt16LE(3);
-                    if (Number.isFinite(x) && Number.isFinite(y)) { 
-                        p.mouseX = x; 
-                        p.mouseY = y; 
-                    }
+                    if (Number.isFinite(x) && Number.isFinite(y)) { p.mouseX = x; p.mouseY = y; }
                 }
                 break;
             case 17:
@@ -476,7 +436,6 @@ wss.on('connection', (ws) => {
 
 setInterval(tick, CFG.tickMs);
 
-// Avvio su tutte le interfacce per Railway
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 ZeroAgar Server running on port ${PORT}`);
 });
