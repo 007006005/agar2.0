@@ -1,14 +1,28 @@
+'use strict';
+/*
+ * Server agar.io minimale: serve i file statici tramite Express e gestisce
+ * il WebSocket (stesso host/porta) con il protocollo che il client si aspetta.
+ */
 const express = require('express');
-const app = express();
+const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
+const { WebSocketServer } = require('ws');
 const cors = require('cors');
 
+const app = express();
 const PORT = process.env.PORT || 8080;
+const PUBLIC = path.join(__dirname, 'public');
 
-// Permetti connessioni esterne (utile se il game server è separato dal client)
+// ---- Variabili d'ambiente (login/progressi)
+const AUTH_SECRET  = process.env.AUTH_SECRET  || ''; 
+const SERVER_KEY   = process.env.SERVER_KEY   || ''; 
+const API_SAVE_URL = process.env.API_SAVE_URL || ''; 
+
+// ---- Middleware Express per file statici e CORS
 app.use(cors());
 
-// Aggiungi gli header corretti per i file JSON (incluso manifest.json)
+// Risoluzione corretta del Content-Type per manifest.json
 app.use((req, res, next) => {
     if (req.url.endsWith('.json')) {
         res.setHeader('Content-Type', 'application/json');
@@ -16,65 +30,42 @@ app.use((req, res, next) => {
     next();
 });
 
-// Servi TUTTI i file statici dalla root o dalla cartella 'public' 
-// Sostituisci __dirname con path.join(__dirname, 'public') se i tuoi file sono dentro /public
-app.use(express.static(__dirname, {
-    setHeaders: (res, path, stat) => {
-        // Forza la cache per le immagini
-        if (path.endsWith('.webp') || path.endsWith('.png') || path.endsWith('.svg')) {
+// Servi tutti i file dentro public/ staticamente
+app.use(express.static(PUBLIC, {
+    setHeaders: (res, reqPath) => {
+        if (reqPath.endsWith('.webp') || reqPath.endsWith('.png') || reqPath.endsWith('.svg') || reqPath.endsWith('.json')) {
             res.set('Cache-Control', 'public, max-age=31536000');
         }
     }
 }));
 
-// Fallback: se nessuna route viene trovata, restituisci il file di gioco principale
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'game.html')); // o 'public/game.html'
-});
+// Route per il gioco (il gioco di default si trova su /games/agar)
+app.get('/', (req, res) => res.redirect('/games/agar/game.html'));
+app.get('/index.html', (req, res) => res.redirect('/games/agar/game.html'));
+app.get('/games/agar', (req, res) => res.redirect('/games/agar/game.html'));
+app.get('/games/agar/', (req, res) => res.redirect('/games/agar/game.html'));
+app.get('/games/agar/index.html', (req, res) => res.redirect('/games/agar/game.html'));
+app.get('/health', (req, res) => res.status(200).send('ok'));
 
-app.listen(PORT, () => {
-    console.log(`🚀 ZeroAgar Server running on port ${PORT}`);
-});
-
-
-'use strict';
-/*
- * Server agar.io minimale: serve i file statici in ./public e gestisce
- * il WebSocket (stesso host/porta) con il protocollo che il client si aspetta.
- * Avvio: npm install && npm start   (Railway usa la variabile PORT)
- */
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
-
-const PORT = process.env.PORT || 8080;
-const PUBLIC = path.join(__dirname, 'public');
-
-// ---- Login / progressi (variabili d'ambiente su Railway)
-const AUTH_SECRET  = process.env.AUTH_SECRET  || '';   // uguale a 'auth_secret' in config.php
-const SERVER_KEY   = process.env.SERVER_KEY   || '';   // uguale a 'server_key' in config.php
-const API_SAVE_URL = process.env.API_SAVE_URL || '';   // https://zerothelegend.com/games/agar/api/save.php
-
+// ---- Configurazione Gioco Agar
 const CFG = {
-  border: 14000,        // mappa quadrata 0..border (il client usa int16: max 32767)
-  tickMs: 40,           // 25 tick/s
+  border: 14000,        
+  tickMs: 40,           
   foodMax: 700, foodSize: 10,
   virusMax: 12, virusSize: 100,
   startSize: 32, minSplitSize: 60, maxCells: 16,
   ejectSize: 36, ejectCostArea: 1600, minEjectSize: 57,
   maxSize: 1500,
-  mergeBaseTicks: 375,  // ~15 s
+  mergeBaseTicks: 375,  
   viewHalfW: 1100, viewHalfH: 700,
   maxPlayers: 60,
 };
 
-// ---------------------------------------------------------------- mondo
+// ---- Mondo
 let nextId = 1, tickCount = 0, foodCount = 0, virusCount = 0;
-const cells = new Map();     // id -> cella
+const cells = new Map();     
 const players = new Set();
-let eatEvents = [];          // [{k, v}] del tick corrente
+let eatEvents = [];          
 
 const rnd = (a, b) => a + Math.random() * (b - a);
 const randColor = () => {
@@ -113,7 +104,7 @@ function newPlayerCell(p, x, y, size) {
   return c;
 }
 
-// ---------------------------------------------------------------- binario
+// ---- Binario
 const strBytes = (s) => (s.length + 1) * 2;
 function putStr(buf, off, s) {
   for (let i = 0; i < s.length; i++) buf.writeUInt16LE(s.charCodeAt(i), off + 2 * i);
@@ -140,8 +131,7 @@ function sendChatMsg(p, name, color, text) {
   sendRaw(p, b);
 }
 
-
-// ---------------------------------------------------------------- account
+// ---- Account
 const b64uDec = (s) => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 function verifyToken(tok) {
   if (!AUTH_SECRET || typeof tok !== 'string' || tok.length > 400) return null;
@@ -168,7 +158,6 @@ async function postSave(payload, attempt = 1) {
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
   } catch (e) {
-    // session_uid è univoco lato DB: ritentare è sicuro (nessun doppio conteggio)
     if (attempt < 4) setTimeout(() => postSave(payload, attempt + 1), attempt * 5000);
     else console.log('[save] fallito per utente', payload.user_id, e.message);
   }
@@ -190,7 +179,7 @@ function endSession(p) {
   });
 }
 
-// ---------------------------------------------------------------- azioni
+// ---- Azioni
 function totalArea(p) { return p.cells.reduce((s, c) => s + c.size * c.size, 0); }
 
 function spawnPlayer(p, name) {
@@ -256,13 +245,12 @@ function eatCell(eater, prey) {
   }
 }
 
-// ---------------------------------------------------------------- tick
+// ---- Tick
 function tick() {
   tickCount++;
   eatEvents = [];
   const B = CFG.border;
 
-  // movimento
   for (const c of cells.values()) {
     if (c.type === 'player') {
       const p = c.owner;
@@ -282,7 +270,6 @@ function tick() {
     c.y = Math.max(r, Math.min(B - r, c.y));
   }
 
-  // celle dello stesso giocatore: separazione / fusione
   for (const p of players) {
     const cs = p.cells;
     for (let i = 0; i < cs.length; i++) {
@@ -306,7 +293,6 @@ function tick() {
     }
   }
 
-  // mangiare
   for (const p of players) {
     for (const c of p.cells.slice()) {
       if (c.dead) continue;
@@ -328,7 +314,6 @@ function tick() {
     }
   }
 
-  // eject contro virus
   for (const v of Array.from(cells.values())) {
     if (v.type !== 'virus' || v.dead) continue;
     for (const e of cells.values()) {
@@ -346,19 +331,16 @@ function tick() {
     }
   }
 
-  // decadimento massa (1 volta al secondo)
   if (tickCount % 25 === 0) {
     for (const p of players) for (const c of p.cells) if (c.size > 35) c.size *= 0.999;
     for (const p of players) if (p.session) p.session.maxMass = Math.max(p.session.maxMass, Math.round(totalArea(p) / 100));
   }
 
-  // ripopolamento
   for (let i = 0; i < 6 && foodCount < CFG.foodMax; i++)
     addCell('food', rnd(20, CFG.border - 20), rnd(20, CFG.border - 20), CFG.foodSize, randColor());
   if (virusCount < CFG.virusMax && tickCount % 50 === 0)
     addCell('virus', rnd(300, CFG.border - 300), rnd(300, CFG.border - 300), CFG.virusSize, [51, 255, 51]);
 
-  // classifica
   let lbBuf = null;
   if (tickCount % 25 === 0) {
     const top = Array.from(players).filter(p => p.cells.length)
@@ -369,7 +351,6 @@ function tick() {
     for (const t of top) { lbBuf.writeUInt32LE(t.p.cells[0].id, o); o = putStr(lbBuf, o + 4, t.p.name); }
   }
 
-  // aggiornamenti ai client
   let leader = null;
   for (const p of players) if (p.cells.length && (!leader || totalArea(p) > totalArea(leader))) leader = p;
   for (const p of players) {
@@ -421,33 +402,10 @@ function tick() {
   }
 }
 
-// ---------------------------------------------------------------- rete
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp',
-  '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.json': 'application/json', '.gif': 'image/gif',
-  '.woff2': 'font/woff2', '.woff': 'font/woff', '.txt': 'text/plain; charset=utf-8' };
-
-const server = http.createServer((req, res) => {
-  let url = decodeURIComponent((req.url || '/').split('?')[0]);
-  if (url === '/health') { res.writeHead(200); return res.end('ok'); }
-  const GAME = '/games/agar';
-  if (url === '/' || url === '/index.html' || url === '/index.php') { res.writeHead(302, { Location: GAME + '/' }); return res.end(); }
-  if (url === GAME) { res.writeHead(301, { Location: GAME + '/' }); return res.end(); }
-  if (url === GAME + '/' || url === GAME + '/index.html' || url === GAME + '/index.php') url = GAME + '/game.html';
-  const file = path.normalize(path.join(PUBLIC, url));
-  if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end('Forbidden'); }
-  fs.stat(file, (err, st) => {
-    if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
-    const ext = path.extname(file).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600',
-    });
-    fs.createReadStream(file).pipe(res);
-  });
-});
-
+// ---- Avvio Server Express & WebSockets
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 2048 });
+
 wss.on('connection', (ws) => {
   if (players.size >= CFG.maxPlayers) return ws.close();
   const p = { ws, cells: [], name: '', color: randColor(), mouseX: 0, mouseY: 0, alive: false,
@@ -460,10 +418,10 @@ wss.on('connection', (ws) => {
     const op = data[0];
     switch (op) {
       case 255: sendBorder(p); break;
-      case 150:                         // token di login (opzionale: senza = ospite)
+      case 150: 
         if (!p.user && data.length > 1 && data.length < 800) p.user = verifyToken(data.toString('utf16le', 1));
         break;
-      case 192: {                       // nickname = spawn
+      case 192: { 
         let name = data.toString('utf16le', 1).replace(/[\u0000-\u001f]/g, '').slice(0, 40);
         spawnPlayer(p, name || '{1}Player');
         break;
@@ -485,9 +443,9 @@ wss.on('connection', (ws) => {
         for (const q of players) sendChatMsg(q, p.name, p.color, text);
         break;
       }
-      default: break;                   // 254, 56, 18, 19, 65: ignorati
     }
   });
+  
   ws.on('close', () => {
     endSession(p);
     for (const c of p.cells.slice()) removeCell(c);
@@ -499,4 +457,4 @@ wss.on('connection', (ws) => {
 if (!AUTH_SECRET || !SERVER_KEY || !API_SAVE_URL) console.log('[auth] AUTH_SECRET/SERVER_KEY/API_SAVE_URL mancanti: login e salvataggio disattivati');
 setInterval(tick, CFG.tickMs);
 setInterval(() => console.log(`[stat] giocatori=${players.size} celle=${cells.size}`), 60000);
-server.listen(PORT, () => console.log(`Server su porta ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 ZeroAgar Server & Game running on port ${PORT}`));
